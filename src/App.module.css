@@ -1,0 +1,84 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ── Sidebar ── */
+.sidebar {
+  width: var(--sidebar-w);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.navBtn {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-lg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: var(--muted);
+  transition: background var(--transition), color var(--transition);
+  position: relative;
+}
+.navBtn:hover { background: var(--bg-hover); color: var(--text); }
+.navActive {
+  background: var(--accent-dim) !important;
+  color: var(--accent) !important;
+}
+
+.navLabel {
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+
+.main {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Mock banner ── */
+.mockBanner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 26px;
+  background: rgba(240,160,48,0.08);
+  border-bottom: 1px solid rgba(240,160,48,0.2);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--amber);
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+
+.mockDot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  animation: pulse 1.8s ease-in-out infinite;
+}

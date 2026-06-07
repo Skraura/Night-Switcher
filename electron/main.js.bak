@@ -1,0 +1,349 @@
+'use strict'
+
+const { app, BrowserWindow, ipcMain, Menu } = require('electron')
+const path   = require('path')
+const fs     = require('fs')
+const os     = require('os')
+const { execSync, spawn } = require('child_process')
+
+// ─── Paths ────────────────────────────────────────────────────────────────────
+
+const APPDATA      = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming')
+const DATA_DIR     = path.join(APPDATA, 'NightSwitcher')
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json')
+
+// DoD tracker integration file (written by DoD Tracker, read by us)
+const DOD_FILE = (() => {
+  for (const name of ['TcNo Account Switcher', 'TcNo-Acc-Switcher', 'NightSwitcher']) {
+    const p = path.join(APPDATA, name, 'dod-integration.json')
+    if (fs.existsSync(p)) return p
+  }
+  return path.join(APPDATA, 'TcNo Account Switcher', 'dod-integration.json')
+})()
+
+// Night Switcher ↔ DoD Tracker IPC file (we write requests, DoD Tracker acts on them)
+const DOD_ACTION_FILE  = path.join(DATA_DIR, 'dod-action-request.json')
+const DOD_ACTION_RESPONSE = path.join(DATA_DIR, 'dod-action-response.json')
+
+fs.mkdirSync(DATA_DIR, { recursive: true })
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+function loadSettings() {
+  try { return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) } catch { return {} }
+}
+function saveSettings(s) {
+  const cur = loadSettings()
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ ...cur, ...s }, null, 2))
+}
+
+// ─── Steam: read ALL accounts from loginusers.vdf ─────────────────────────────
+
+function findSteamPath() {
+  const candidates = [
+    process.env.STEAM_PATH,
+    'C:\\Program Files (x86)\\Steam',
+    'C:\\Program Files\\Steam',
+    process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'Steam'),
+    process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'Steam'),
+  ].filter(Boolean)
+
+  for (const p of candidates) {
+    if (p && fs.existsSync(path.join(p, 'Steam.exe'))) return p
+  }
+
+  // Try registry
+  try {
+    const reg = execSync('reg query "HKCU\\Software\\Valve\\Steam" /v SteamPath', { encoding: 'utf8' })
+    const match = reg.match(/SteamPath\s+REG_SZ\s+(.+)/)
+    if (match) return match[1].trim()
+  } catch {}
+  return null
+}
+
+function parseSteamVdf(content) {
+  // Simple VDF text parser for loginusers.vdf
+  // Returns { steamid: { AccountName, PersonaName, MostRecent, ... } }
+  const users = {}
+  const userBlockRe = /\"(7656119\d+)\"\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/gs
+  const kvRe = /\"(\w+)\"\s+\"([^\"]*)\"/g
+  let um
+  while ((um = userBlockRe.exec(content)) !== null) {
+    const id = um[1]
+    const block = um[2]
+    const fields = {}
+    let kv
+    while ((kv = kvRe.exec(block)) !== null) {
+      fields[kv[1]] = kv[2]
+    }
+    users[id] = fields
+  }
+  return users
+}
+
+function getSteamAccounts() {
+  const steamPath = findSteamPath()
+  if (!steamPath) return { ok: false, error: 'Steam not found. Make sure Steam is installed.', accounts: [] }
+
+  const vdfFile = path.join(steamPath, 'config', 'loginusers.vdf')
+  if (!fs.existsSync(vdfFile)) return { ok: false, error: 'loginusers.vdf not found.', accounts: [] }
+
+  try {
+    const content = fs.readFileSync(vdfFile, 'utf8')
+    const users   = parseSteamVdf(content)
+    const accounts = Object.entries(users).map(([id, f]) => ({
+      id,
+      name:       f.PersonaName || f.AccountName || id,
+      accountName: f.AccountName || '',
+      mostRecent: f.MostRecent === '1',
+      avatar:     getSteamAvatar(steamPath, id),
+    }))
+    return { ok: true, accounts, steamPath }
+  } catch (err) {
+    return { ok: false, error: err.message, accounts: [] }
+  }
+}
+
+// FIX: Return a base64 data URL instead of a raw file path.
+// This avoids Electron's file:// security restrictions in the renderer,
+// and also broadens the search to cover all naming patterns Steam uses.
+function getSteamAvatar(steamPath, steamId) {
+  // Steam's avatarcache names files by a hash, but sometimes also by
+  // the lower 32 bits of the SteamID (SteamID3 / accountID).
+  const steamId32 = (BigInt(steamId) & 0xFFFFFFFFn).toString()
+
+  const searchDirs = [
+    path.join(steamPath, 'config', 'avatarcache'),
+    path.join(steamPath, 'appcache', 'librarycache'),
+  ]
+
+  for (const dir of searchDirs) {
+    if (!fs.existsSync(dir)) continue
+    let files
+    try { files = fs.readdirSync(dir) } catch { continue }
+
+    const candidate = files.find(f =>
+      f.startsWith(steamId) ||
+      f.startsWith(steamId32) ||
+      f.includes(steamId32)
+    )
+
+    if (candidate) {
+      try {
+        const filePath = path.join(dir, candidate)
+        const data = fs.readFileSync(filePath)
+        const ext  = candidate.toLowerCase().endsWith('.png') ? 'png' : 'jpeg'
+        return `data:image/${ext};base64,${data.toString('base64')}`
+      } catch { continue }
+    }
+  }
+
+  return null
+}
+
+function getActiveSteamAccount() {
+  const result = getSteamAccounts()
+  if (!result.ok) return null
+  return result.accounts.find(a => a.mostRecent) || null
+}
+
+// ─── Running Games ────────────────────────────────────────────────────────────
+
+function getRunningGames() {
+  // Find running Steam game processes by looking for steam_appid.txt in temp
+  // or by scanning processes for known Steam game patterns
+  const games = []
+  try {
+    const out = execSync(
+      'wmic process where "ExecutablePath like \'%SteamApps%\'" get ProcessId,ExecutablePath /format:csv',
+      { encoding: 'utf8', timeout: 5000 }
+    )
+    const lines = out.split('\n').filter(l => l.includes('steamapps'))
+    for (const line of lines) {
+      const parts = line.split(',')
+      if (parts.length >= 3) {
+        const exePath = parts[1]?.trim()
+        const pid     = parts[2]?.trim()
+        if (exePath && pid) {
+          const match = exePath.match(/steamapps[\\\/]common[\\\/]([^\\\/]+)[\\\/]/i)
+          const appIdMatch = exePath.match(/appmanifest_(\d+)\.acf/i)
+          games.push({ pid: parseInt(pid), exePath, gameName: match ? match[1] : 'Unknown' })
+        }
+      }
+    }
+  } catch {}
+  return games
+}
+
+// FIX: Added /T flag to kill the entire process tree, not just the parent.
+// Without /T, child processes (anti-cheat, sub-launchers, etc.) keep the
+// window alive as a zombie that can't be closed without Task Manager.
+function killProcess(pid) {
+  try { execSync(`taskkill /F /T /PID ${pid}`, { timeout: 5000 }) } catch {}
+}
+
+function killSteam(steamPath) {
+  try { execSync('taskkill /F /IM steam.exe', { timeout: 5000 }) } catch {}
+}
+
+function launchSteamWithAccount(steamPath, accountName) {
+  // Steam supports -login <user> <pass> but we use the registry/autoLogin approach
+  // Write the AutoLoginUser registry key so Steam logs in automatically
+  try {
+    execSync(`reg add "HKCU\\Software\\Valve\\Steam" /v AutoLoginUser /t REG_SZ /d "${accountName}" /f`)
+    execSync(`reg add "HKCU\\Software\\Valve\\Steam" /v RememberPassword /t REG_DWORD /d 1 /f`)
+  } catch {}
+  // FIX: Removed -silent flag. Steam with -silent can silently fail to start
+  // if its lock files haven't fully released yet. Without it, Steam shows its
+  // normal loading window and is more reliable at completing startup.
+  spawn(path.join(steamPath, 'Steam.exe'), [], { detached: true, stdio: 'ignore' }).unref()
+}
+
+function launchGame(appId) {
+  spawn('cmd', ['/c', `start steam://rungameid/${appId}`], { detached: true, stdio: 'ignore' }).unref()
+}
+
+function getInstalledGames(steamPath) {
+  const steamAppsDir = path.join(steamPath, 'steamapps')
+  if (!fs.existsSync(steamAppsDir)) return []
+  const games = []
+  try {
+    const files = fs.readdirSync(steamAppsDir).filter(f => f.startsWith('appmanifest_') && f.endsWith('.acf'))
+    for (const f of files) {
+      const content = fs.readFileSync(path.join(steamAppsDir, f), 'utf8')
+      const appId   = f.match(/appmanifest_(\d+)\.acf/)?.[1]
+      const nameMatch = content.match(/"name"\s+"([^"]+)"/)
+      if (appId && nameMatch) games.push({ appId, name: nameMatch[1] })
+    }
+  } catch {}
+  return games
+}
+
+// ─── DoD Integration (read-only — DoD Tracker writes the file) ───────────────
+
+function readDodIntegration() {
+  try {
+    if (!fs.existsSync(DOD_FILE)) return null
+    return JSON.parse(fs.readFileSync(DOD_FILE, 'utf8'))
+  } catch { return null }
+}
+
+// Write a dragon action request for DoD Tracker to pick up
+// DoD Tracker watches dod-integration.json and our request file
+function writeDragonAction(action) {
+  // action: { dragonId, type: 'kill'|'dead'|'hungry', steamId }
+  const req = { ...action, timestamp: Date.now(), processed: false }
+  fs.writeFileSync(DOD_ACTION_FILE, JSON.stringify(req, null, 2))
+  // Also update dod-integration.json directly (optimistic local update)
+  // The DoD Tracker will sync to Firebase when it sees the action
+  try {
+    const integ = readDodIntegration()
+    if (!integ) return { ok: true, note: 'no_integration_file' }
+    for (const [accId, dragons] of Object.entries(integ.dragons || {})) {
+      const dragon = dragons.find(d => d.dragon_id === action.dragonId)
+      if (!dragon) continue
+      if (action.type === 'kill') {
+        dragon.growth  = 'Hatchling'
+        dragon.is_dead = false
+      } else if (action.type === 'dead') {
+        dragon.is_dead = true
+      } else if (action.type === 'hungry') {
+        dragon.is_hungry = !dragon.is_hungry
+      }
+    }
+    integ.pendingAction = req
+    integ.updatedAt = Date.now()
+    fs.writeFileSync(DOD_FILE, JSON.stringify(integ, null, 2))
+  } catch (err) {
+    console.warn('[dod-action] Could not update integration file:', err.message)
+  }
+  return { ok: true }
+}
+
+// ─── Window ───────────────────────────────────────────────────────────────────
+
+let mainWindow
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 900,
+    height: 620,
+    minWidth: 700,
+    minHeight: 500,
+    frame: false,
+    transparent: false,
+    backgroundColor: '#0d0f14',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  icon: path.join(__dirname, '..', 'assets', 'icon.png'),
+  })
+
+  Menu.setApplicationMenu(null)
+
+  const isDev = !app.isPackaged
+  if (isDev) {
+    mainWindow.loadURL('http://localhost:5173')
+    // mainWindow.webContents.openDevTools()
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+  }
+}
+
+app.whenReady().then(createWindow)
+app.on('window-all-closed', () => app.quit())
+
+// ─── IPC Handlers ─────────────────────────────────────────────────────────────
+
+ipcMain.handle('window:minimize', () => mainWindow?.minimize())
+ipcMain.handle('window:maximize', () => {
+  if (mainWindow?.isMaximized()) mainWindow.unmaximize()
+  else mainWindow?.maximize()
+})
+ipcMain.handle('window:close', () => mainWindow?.close())
+
+ipcMain.handle('steam:getAccounts', () => getSteamAccounts())
+ipcMain.handle('steam:getActive', () => getActiveSteamAccount())
+ipcMain.handle('steam:getRunningGames', () => getRunningGames())
+ipcMain.handle('steam:getInstalledGames', (_, { steamPath }) => getInstalledGames(steamPath))
+
+ipcMain.handle('steam:switchAccount', async (_, { accountName, steamPath, runGamesAfter }) => {
+  try {
+    // 1. Kill running games
+    // FIX: increased wait from 1s → 3s so game processes (and their children)
+    // have enough time to fully exit before Steam is killed.
+    const games = getRunningGames()
+    for (const g of games) killProcess(g.pid)
+    await new Promise(r => setTimeout(r, 3000))
+
+    // 2. Kill Steam
+    // FIX: increased wait from 2s → 4s so Steam fully releases its lock files
+    // and registry handles before we attempt to relaunch it.
+    killSteam(steamPath)
+    await new Promise(r => setTimeout(r, 4000))
+
+    // 3. Launch Steam with new account
+    launchSteamWithAccount(steamPath, accountName)
+    await new Promise(r => setTimeout(r, 4000))
+
+    // 4. Re-launch games (only if installed for the new account)
+    if (runGamesAfter && runGamesAfter.length > 0) {
+      const installed = getInstalledGames(steamPath)
+      const installedIds = new Set(installed.map(g => g.appId))
+      for (const appId of runGamesAfter) {
+        if (installedIds.has(String(appId))) launchGame(appId)
+      }
+    }
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('dod:read', () => readDodIntegration())
+ipcMain.handle('dod:action', (_, action) => writeDragonAction(action))
+
+ipcMain.handle('settings:load', () => loadSettings())
+ipcMain.handle('settings:save', (_, s) => { saveSettings(s); return { ok: true } })

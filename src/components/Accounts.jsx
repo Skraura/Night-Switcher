@@ -1,0 +1,340 @@
+import { useState, useEffect, useCallback, useRef } from 'react'
+import ContextMenu   from './ContextMenu'
+import DragonTooltip from './DragonTooltip'
+import styles from './Accounts.module.css'
+
+// Steam SVG icon (official logo path)
+const SteamIcon = ({ size = 32 }) => (
+  <svg width={size} height={size} viewBox="0 0 48 48" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+    <path d="M24 4C13 4 4 13 4 24c0 9.3 6.3 17.2 15 19.5l5.4-9.4c-0.1-0.4-0.2-0.7-0.2-1.1 0-2.8 2.2-5 5-5 0.4 0 0.8 0 1.1 0.1l5-8.7C35.8 13.5 30.3 9 24 9c-4.1 0-7.9 1.6-10.7 4.3L8 10C11.4 7.4 15.5 6 20 6c1.4 0 2.7 0.1 4 0.4z"/>
+    <path d="M22.3 33c0 0.5 0.1 1 0.3 1.4l-4.6 8c-6.8-2.7-11.6-9.3-12-17l8.5 3.5c0.5 2.3 2.6 4.1 4.8 4.1 1.1 0 2.2-0.4 3-1z"/>
+    <circle cx="29" cy="27" r="4"/>
+  </svg>
+)
+
+export default function Accounts({ settings, onSettingChange, api }) {
+  const [accounts,     setAccounts]    = useState([])
+  const [activeId,     setActiveId]    = useState(null)
+  const [steamPath,    setSteamPath]   = useState(null)
+  const [dodData,      setDodData]     = useState(null)
+  const [tickTimes,    setTickTimes]   = useState({})
+  const [loading,      setLoading]     = useState(true)
+  const [error,        setError]       = useState(null)
+  const [hoveredId,    setHoveredId]   = useState(null)
+  const [contextMenu,  setContextMenu] = useState(null)
+  const [switching,    setSwitching]   = useState(false)
+  const [switchStatus, setSwitchStatus]= useState('')
+  const [search,       setSearch]      = useState('')
+
+  // For tooltip sticky hover — track if mouse is over card or tooltip
+  const hideTimer   = useRef(null)
+  const cardRefs    = useRef({})
+  const containerRef = useRef(null)
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null)
+    try {
+      const [accResult, dod, times] = await Promise.all([
+        api?.steam.getAccounts(),
+        api?.dod.read(),
+        api?.dod.getTickTimes(),
+      ])
+      if (accResult?.ok) {
+        setAccounts(accResult.accounts)
+        setSteamPath(accResult.steamPath)
+        setActiveId(accResult.accounts.find(a => a.mostRecent)?.id || null)
+      } else {
+        setError(accResult?.error || 'Could not load Steam accounts.')
+      }
+      setDodData(dod)
+      setTickTimes(times || {})
+    } catch (e) {
+      setError(e.message)
+    }
+    setLoading(false)
+  }, [api])
+
+  useEffect(() => {
+    load()
+    const interval = setInterval(async () => {
+      const [dod, times] = await Promise.all([
+        api?.dod.read(),
+        api?.dod.getTickTimes(),
+      ])
+      setDodData(dod)
+      setTickTimes(times || {})
+    }, 5000)
+    return () => clearInterval(interval)
+  }, [load])
+
+  useEffect(() => {
+    if (!contextMenu) return
+    const handler = () => setContextMenu(null)
+    window.addEventListener('click', handler)
+    window.addEventListener('contextmenu', handler)
+    return () => {
+      window.removeEventListener('click', handler)
+      window.removeEventListener('contextmenu', handler)
+    }
+  }, [contextMenu])
+
+  function getDragonsForAccount(steamId) {
+    if (!dodData?.dragons) return []
+    let dragons = dodData.dragons[steamId] || []
+    if (!dragons.length && dodData.mappings) {
+      const dodAccId = Object.entries(dodData.mappings).find(([, sid]) => sid === steamId)?.[0]
+      if (dodAccId) dragons = dodData.dragons[dodAccId] || []
+    }
+    return dragons
+  }
+
+  // Sticky tooltip: single shared timer so card→tooltip gap never dismisses it
+  function clearHideTimer() {
+    if (hideTimer.current) { clearTimeout(hideTimer.current); hideTimer.current = null }
+  }
+  function scheduleHide() {
+    clearHideTimer()
+    hideTimer.current = setTimeout(() => { setHoveredId(null); hideTimer.current = null }, 300)
+  }
+  function handleCardMouseEnter(id) {
+    clearHideTimer()
+    setHoveredId(id)
+  }
+  function handleCardMouseLeave() {
+    scheduleHide()
+  }
+  function handleTooltipMouseEnter() {
+    clearHideTimer()
+  }
+  function handleTooltipMouseLeave() {
+    scheduleHide()
+  }
+
+  // Determine which anchor side to use so tooltip stays on screen
+  function getTooltipSide(accId) {
+    const el = cardRefs.current[accId]
+    const container = containerRef.current
+    if (!el || !container) return 'center'
+    const cRect = container.getBoundingClientRect()
+    const eRect = el.getBoundingClientRect()
+    const relLeft  = eRect.left  - cRect.left
+    const relRight = cRect.right - eRect.right
+    const tooltipW = 280
+    // If card is near the left edge and there's not enough room centered
+    if (relLeft < tooltipW / 2) return 'left'
+    if (relRight < tooltipW / 2) return 'right'
+    return 'center'
+  }
+
+  async function switchTo(account) {
+    if (switching) return
+    setSwitching(true); setContextMenu(null)
+    try {
+      setSwitchStatus('Stopping running games…')
+      const unsub = api?.steam.onSwitchStatus?.((msg) => setSwitchStatus(msg))
+      await api?.steam.switchAccount({ accountName: account.accountName, steamPath, runGamesAfter: [] })
+      unsub?.()
+      setActiveId(account.id)
+      setSwitchStatus(`Switched to ${account.name}`)
+      setTimeout(() => { setSwitching(false); setSwitchStatus(''); load() }, 3000)
+    } catch (e) {
+      setSwitchStatus('Error: ' + e.message)
+      setTimeout(() => { setSwitching(false); setSwitchStatus('') }, 3000)
+    }
+  }
+
+  async function dragonAction(dragonId, type, steamId) {
+    await api?.dod.action({ dragonId, type, steamId })
+    if (type === 'tick') {
+      await api?.dod.recordTick({ dragonId })
+      setTickTimes(prev => ({ ...prev, [dragonId]: Date.now() }))
+    }
+    setDodData(await api?.dod.read())
+  }
+
+  function onContextMenu(e, account) {
+    e.preventDefault(); e.stopPropagation()
+    const rect = containerRef.current?.getBoundingClientRect() || { left: 0, top: 0 }
+    setContextMenu({ x: e.clientX - rect.left, y: e.clientY - rect.top, account })
+  }
+
+  const viewMode = settings.viewMode || 'grid'
+  const cardSize = settings.cardSize || 'comfortable'
+
+  const filtered = accounts.filter(a => {
+    if (!search) return true
+    const q = search.toLowerCase()
+    return a.name?.toLowerCase().includes(q) || a.accountName?.toLowerCase().includes(q)
+  })
+
+  if (loading) return (
+    <div className={styles.center}>
+      <div className={styles.spinner} />
+      <span className={styles.loadText}>Scanning Steam accounts…</span>
+    </div>
+  )
+
+  if (error) return (
+    <div className={styles.center}>
+      <div className={styles.errorIcon}>
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <circle cx="12" cy="16" r="0.5" fill="currentColor"/>
+        </svg>
+      </div>
+      <div className={styles.errorMsg}>{error}</div>
+      <button className={styles.retryBtn} onClick={load}>Try again</button>
+    </div>
+  )
+
+  return (
+    <div className={styles.wrap} ref={containerRef}>
+      {switching && (
+        <div className={styles.switchOverlay}>
+          <div className={styles.switchCard}>
+            <div className={styles.switchSpinner} />
+            <div className={styles.switchStatus}>{switchStatus}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Toolbar */}
+      <div className={styles.toolbar}>
+        <div className={styles.searchWrap}>
+          <svg className={styles.searchIcon} width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <input
+            className={styles.search}
+            placeholder="Search accounts…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+          />
+          {search && (
+            <button className={styles.clearSearch} onClick={() => setSearch('')}>✕</button>
+          )}
+        </div>
+        <div className={styles.toolbarRight}>
+          <span className={styles.count}>{filtered.length} account{filtered.length !== 1 ? 's' : ''}</span>
+          <div className={styles.viewToggle}>
+            <button
+              className={`${styles.viewBtn} ${viewMode === 'grid' ? styles.viewActive : ''}`}
+              onClick={() => onSettingChange({ viewMode: 'grid' })}
+              title="Grid view"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                <rect x="0" y="0" width="6" height="6" rx="1.5"/>
+                <rect x="10" y="0" width="6" height="6" rx="1.5"/>
+                <rect x="0" y="10" width="6" height="6" rx="1.5"/>
+                <rect x="10" y="10" width="6" height="6" rx="1.5"/>
+              </svg>
+            </button>
+            <button
+              className={`${styles.viewBtn} ${viewMode === 'list' ? styles.viewActive : ''}`}
+              onClick={() => onSettingChange({ viewMode: 'list' })}
+              title="List view"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                <rect x="0" y="0" width="16" height="3" rx="1.5"/>
+                <rect x="0" y="6.5" width="16" height="3" rx="1.5"/>
+                <rect x="0" y="13" width="16" height="3" rx="1.5"/>
+              </svg>
+            </button>
+          </div>
+          <button className={styles.refreshBtn} onClick={load} title="Refresh">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+              <path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {/* Account grid / list */}
+      <div className={`${styles.content} ${viewMode === 'list' ? styles.listMode : ''} ${styles[`size_${cardSize}`]}`}>
+        {filtered.length === 0 && (
+          <div className={styles.empty}>No accounts match "{search}"</div>
+        )}
+        {filtered.map(acc => {
+          const isActive  = acc.id === activeId
+          const isHovered = acc.id === hoveredId
+          const dragons   = getDragonsForAccount(acc.id)
+          const aliveDragons = dragons.filter(d => !d.is_dead)
+          const hungryCount  = aliveDragons.filter(d => d.is_hungry).length
+          const tooltipSide  = getTooltipSide(acc.id)
+
+          return (
+            <div
+              key={acc.id}
+              ref={el => cardRefs.current[acc.id] = el}
+              className={`${styles.card} ${isActive ? styles.cardActive : ''} ${viewMode === 'list' ? styles.cardList : ''}`}
+              onMouseEnter={() => handleCardMouseEnter(acc.id)}
+              onMouseLeave={() => handleCardMouseLeave()}
+              onContextMenu={e => onContextMenu(e, acc)}
+              onDoubleClick={() => !isActive && switchTo(acc)}
+            >
+              {/* Avatar — Steam icon as fallback */}
+              <div className={styles.avatar}>
+                {acc.avatar
+                  ? <img src={acc.avatar} alt="" className={styles.avatarImg} onError={e => e.target.style.display='none'} />
+                  : (
+                    <div className={styles.avatarFallback}>
+                      <SteamIcon size={viewMode === 'list' ? 22 : 30} />
+                    </div>
+                  )
+                }
+                {isActive && <div className={styles.activeDot} />}
+              </div>
+
+              {/* Name info */}
+              <div className={styles.cardInfo}>
+                <div className={styles.cardName}>{acc.name}</div>
+                {acc.accountName && acc.accountName !== acc.name && (
+                  <div className={styles.cardSub}>@{acc.accountName}</div>
+                )}
+              </div>
+
+              {/* Badges */}
+              <div className={styles.badges}>
+                {isActive && <span className={styles.badgeActive}>Active</span>}
+                {dragons.length > 0 && (
+                  <span className={styles.badgeDragon}>
+                    🐉 {dragons.length}{hungryCount > 0 ? ` · ${hungryCount}🍖` : ''}
+                  </span>
+                )}
+              </div>
+
+              {/* Sticky dragon tooltip */}
+              {isHovered && dragons.length > 0 && (
+                <div
+                  onMouseEnter={() => handleTooltipMouseEnter()}
+                  onMouseLeave={() => handleTooltipMouseLeave()}
+                >
+                  <DragonTooltip
+                    dragons={dragons}
+                    settings={settings}
+                    side={tooltipSide}
+                    tickTimes={tickTimes}
+                    onAction={(dragonId, type) => dragonAction(dragonId, type, acc.id)}
+                  />
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          account={contextMenu.account}
+          isActive={contextMenu.account.id === activeId}
+          onSwitch={() => switchTo(contextMenu.account)}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,96 @@
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  height: 36px;
+  font-size: 12.5px;
+  flex-shrink: 0;
+  border-bottom: 1px solid transparent;
+  animation: slideDown 0.22s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-100%); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* State colours */
+.available,
+.downloading {
+  background: rgba(99, 102, 241, 0.12);
+  border-color: rgba(99, 102, 241, 0.22);
+  color: #a5b4fc;
+}
+
+.ready {
+  background: rgba(34, 197, 94, 0.1);
+  border-color: rgba(34, 197, 94, 0.22);
+  color: #86efac;
+}
+
+.error {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.22);
+  color: #fca5a5;
+}
+
+.icon { font-size: 13px; flex-shrink: 0; }
+
+.text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.text b { font-weight: 700; }
+
+/* Progress bar */
+.progressBar {
+  width: 90px;
+  height: 4px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.progressFill {
+  height: 100%;
+  background: #818cf8;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+/* Install button */
+.installBtn {
+  padding: 3px 10px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: rgba(34, 197, 94, 0.18);
+  border: 1px solid rgba(34, 197, 94, 0.35);
+  color: #86efac;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+  -webkit-app-region: no-drag;
+}
+.installBtn:hover {
+  background: rgba(34, 197, 94, 0.28);
+  border-color: rgba(34, 197, 94, 0.55);
+}
+
+/* Dismiss */
+.dismiss {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-size: 10px;
+  color: currentColor;
+  opacity: 0.45;
+  flex-shrink: 0;
+  transition: opacity 0.15s, background 0.15s;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.dismiss:hover { opacity: 1; background: rgba(255,255,255,0.08); }
